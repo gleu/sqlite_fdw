@@ -27,6 +27,7 @@ REGRESS_OPTS = --inputdir=test --outputdir=test \
 MODULE_big      = $(EXTENSION)
 OBJS         =  $(patsubst %.c,%.o,$(wildcard src/*.c))
 PG_CONFIG    = pg_config
+SHLIB_LINK := -lsqlite3
 
 all: sql/$(EXTENSION)--$(EXTVERSION).sql
 

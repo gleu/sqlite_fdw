@@ -23,6 +23,11 @@
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
 
+#include "funcapi.h"
+#include "utils/rel.h"
+
+#include <sqlite3.h>
+
 PG_MODULE_MAGIC;
 
 /*
@@ -142,6 +147,17 @@ typedef struct
 	char	   *foo;
 	int			bar;
 }	sqliteFdwPlanState;
+
+/*
+ * FDW-specific information for ForeignScanState.fdw_state.
+ */
+
+typedef struct SQLiteFdwExecutionState
+{
+	sqlite3       *conn;
+	sqlite3_stmt  *result;
+	char          *query;
+} SQLiteFdwExecutionState;
 
 
 Datum
@@ -358,8 +374,31 @@ sqliteBeginForeignScan(ForeignScanState *node,
 	 * ExplainForeignScan and EndForeignScan.
 	 *
 	 */
+	sqlite3                  *db;
+	SQLiteFdwExecutionState  *festate;
+	char                     *query;
 
 	elog(DEBUG1,"entering function %s",__func__);
+
+	/* Connect to the server */
+	if (sqlite3_open("/home/guillaume/toto/test.db", &db)) {
+		ereport(ERROR,
+			(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+			errmsg("Can't open sqlite database: %s", sqlite3_errmsg(db))
+			));
+		sqlite3_close(db);
+	}
+
+	/* Build the query */
+	query = (char *)palloc(17);
+	snprintf(query, 17, "SELECT * FROM t1");
+
+	/* Stash away the state info we have already */
+	festate = (SQLiteFdwExecutionState *) palloc(sizeof(SQLiteFdwExecutionState));
+	node->fdw_state = (void *) festate;
+	festate->conn = db;
+	festate->result = NULL;
+	festate->query = query;
 
 }
 
@@ -391,18 +430,44 @@ sqliteIterateForeignScan(ForeignScanState *node)
 	 * (just as you would need to do in the case of a data type mismatch).
 	 */
 
+	char        **values;
+	HeapTuple   tuple;
+	int         x;
+    const char  *pzTail;
+    int         rc;
 
-	/*
-	 * sqliteFdwExecutionState *festate = (sqliteFdwExecutionState *)
-	 * node->fdw_state;
-	 */
+	SQLiteFdwExecutionState *festate = (SQLiteFdwExecutionState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+
+	/* Execute the query, if required */
+	if (!festate->result)
+	{
+		rc = sqlite3_prepare(festate->conn, festate->query, -1, &festate->result, &pzTail);
+		if (rc!=SQLITE_OK) {
+			ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				errmsg("SQL error during prepare: %s", sqlite3_errmsg(festate->conn))
+				));
+			sqlite3_close(festate->conn);
+		}
+	}
 
 	elog(DEBUG1,"entering function %s",__func__);
 
 	ExecClearTuple(slot);
 
 	/* get the next record, if any, and fill in the slot */
+	if (sqlite3_step(festate->result) == SQLITE_ROW)
+	{
+		/* Build the tuple */
+		values = (char **) palloc(sizeof(char *) * sqlite3_column_count(festate->result));
+
+		for (x = 0; x < sqlite3_column_count(festate->result); x++)
+			values[x] = sqlite3_column_text(festate->result, x);
+
+		tuple = BuildTupleFromCStrings(TupleDescGetAttInMetadata(node->ss.ss_currentRelation->rd_att), values);
+		ExecStoreTuple(tuple, slot, InvalidBuffer, false);
+	}
 
 	/* then return the slot */
 	return slot;
@@ -418,7 +483,27 @@ sqliteReScanForeignScan(ForeignScanState *node)
 	 * return exactly the same rows.
 	 */
 
+	SQLiteFdwExecutionState *festate = (SQLiteFdwExecutionState *) node->fdw_state;
+
 	elog(DEBUG1,"entering function %s",__func__);
+
+	if (festate->result)
+	{
+		sqlite3_finalize(festate->result);
+		festate->result = NULL;
+	}
+
+	if (festate->conn)
+	{
+		sqlite3_close(festate->conn);
+		festate->conn = NULL;
+	}
+
+	if (festate->query)
+	{
+		pfree(festate->query);
+		festate->query = 0;
+	}
 
 }
 
