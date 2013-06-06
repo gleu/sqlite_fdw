@@ -24,6 +24,9 @@
 #include "optimizer/restrictinfo.h"
 
 #include "funcapi.h"
+#include "catalog/pg_foreign_server.h"
+#include "catalog/pg_foreign_table.h"
+#include "commands/defrem.h"
 #include "utils/rel.h"
 
 #include <sqlite3.h>
@@ -121,6 +124,12 @@ static bool sqliteAnalyzeForeignTable(Relation relation,
 							 BlockNumber *totalpages);
 #endif
 
+/*
+ * Helper functions
+ */
+static bool sqliteIsValidOption(const char *option, Oid context);
+static void sqliteGetOptions(Oid foreigntableid, char **database, char **table);
+
 /* 
  * structures used by the FDW 
  *
@@ -132,10 +141,26 @@ static bool sqliteAnalyzeForeignTable(Relation relation,
 /*
  * Describes the valid options for objects that use this wrapper.
  */
-struct sqliteFdwOption
+struct SQLiteFdwOption
 {
-	const char *optname;
-	Oid			optcontext;		/* Oid of catalog in which option may appear */
+	const char	*optname;
+	Oid		optcontext;	/* Oid of catalog in which option may appear */
+};
+
+/*
+ * Describes the valid options for objects that use this wrapper.
+ */
+static struct SQLiteFdwOption valid_options[] =
+{
+
+	/* Connection options */
+	{ "database",  ForeignServerRelationId },
+
+	/* Table options */
+	{ "table",     ForeignTableRelationId },
+
+	/* Sentinel */
+	{ NULL,			InvalidOid }
 };
 
 /*
@@ -209,22 +234,129 @@ sqlite_fdw_handler(PG_FUNCTION_ARGS)
 Datum
 sqlite_fdw_validator(PG_FUNCTION_ARGS)
 {
-	List	   *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
+	List      *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
+	Oid       catalog = PG_GETARG_OID(1);
+	char      *svr_database = NULL;
+	char      *svr_table = NULL;
+	ListCell  *cell;
 
 	elog(DEBUG1,"entering function %s",__func__);
 
-	/* make sure the options are valid */
+	/*
+	 * Check that only options supported by sqlite_fdw,
+	 * and allowed for the current object type, are given.
+	 */
+	foreach(cell, options_list)
+	{
+		DefElem	   *def = (DefElem *) lfirst(cell);
 
-	/* no options are supported */
+		if (!sqliteIsValidOption(def->defname, catalog))
+		{
+			struct SQLiteFdwOption *opt;
+			StringInfoData buf;
 
-	if (list_length(options_list) > 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
-				 errmsg("invalid options"),
-				 errhint("sqlite FDW does not support any options")));
+			/*
+			 * Unknown option specified, complain about it. Provide a hint
+			 * with list of valid options for the object.
+			 */
+			initStringInfo(&buf);
+			for (opt = valid_options; opt->optname; opt++)
+			{
+				if (catalog == opt->optcontext)
+					appendStringInfo(&buf, "%s%s", (buf.len > 0) ? ", " : "",
+							 opt->optname);
+			}
+
+			ereport(ERROR, 
+				(errcode(ERRCODE_FDW_INVALID_OPTION_NAME), 
+				errmsg("invalid option \"%s\"", def->defname), 
+				errhint("Valid options in this context are: %s", buf.len ? buf.data : "<none>")
+				));
+		}
+
+		if (strcmp(def->defname, "database") == 0)
+		{
+			if (svr_database)
+				ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					errmsg("redundant options: database (%s)", defGetString(def))
+					));
+
+			svr_database = defGetString(def);
+		}
+		else if (strcmp(def->defname, "table") == 0)
+		{
+			if (svr_table)
+				ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					errmsg("redundant options: table (%s)", defGetString(def))
+					));
+
+			svr_table = defGetString(def);
+		}
+	}
 
 	PG_RETURN_VOID();
 }
+
+/*
+ * Check if the provided option is one of the valid options.
+ * context is the Oid of the catalog holding the object the option is for.
+ */
+static bool
+sqliteIsValidOption(const char *option, Oid context)
+{
+	struct SQLiteFdwOption *opt;
+
+	for (opt = valid_options; opt->optname; opt++)
+	{
+		if (context == opt->optcontext && strcmp(opt->optname, option) == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Fetch the options for a mysql_fdw foreign table.
+ */
+static void
+sqliteGetOptions(Oid foreigntableid, char **database, char **table)
+{
+	ForeignTable   *f_table;
+	ForeignServer  *f_server;
+	List           *options;
+	ListCell       *lc;
+
+	/*
+	 * Extract options from FDW objects.
+	 */
+	f_table = GetForeignTable(foreigntableid);
+	f_server = GetForeignServer(f_table->serverid);
+
+	options = NIL;
+	options = list_concat(options, f_table->options);
+	options = list_concat(options, f_server->options);
+
+	/* Loop through the options */
+	foreach(lc, options)
+	{
+		DefElem *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "database") == 0)
+			*database = defGetString(def);
+
+		if (strcmp(def->defname, "table") == 0)
+			*table = defGetString(def);
+	}
+
+	/* Check we have the options we need to proceed */
+	if (!*database && !*table)
+		ereport(ERROR,
+			(errcode(ERRCODE_SYNTAX_ERROR),
+			errmsg("a database and a table must be specified")
+			));
+}
+
 
 #if (PG_VERSION_NUM >= 90200)
 static void
@@ -376,22 +508,29 @@ sqliteBeginForeignScan(ForeignScanState *node,
 	 */
 	sqlite3                  *db;
 	SQLiteFdwExecutionState  *festate;
+	char                     *svr_database = NULL;
+	char                     *svr_table = NULL;
 	char                     *query;
+    size_t                   len;
 
 	elog(DEBUG1,"entering function %s",__func__);
 
+	/* Fetch options  */
+	sqliteGetOptions(RelationGetRelid(node->ss.ss_currentRelation), &svr_database, &svr_table);
+
 	/* Connect to the server */
-	if (sqlite3_open("/home/guillaume/toto/test.db", &db)) {
+	if (sqlite3_open(svr_database, &db)) {
 		ereport(ERROR,
 			(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
-			errmsg("Can't open sqlite database: %s", sqlite3_errmsg(db))
+			errmsg("Can't open sqlite database %s: %s", svr_database, sqlite3_errmsg(db))
 			));
 		sqlite3_close(db);
 	}
 
 	/* Build the query */
-	query = (char *)palloc(17);
-	snprintf(query, 17, "SELECT * FROM t1");
+    len = strlen(svr_table) + 15;
+    query = (char *)palloc(len);
+    snprintf(query, len, "SELECT * FROM %s", svr_table);
 
 	/* Stash away the state info we have already */
 	festate = (SQLiteFdwExecutionState *) palloc(sizeof(SQLiteFdwExecutionState));
