@@ -27,6 +27,7 @@
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
 #include "commands/defrem.h"
+#include "commands/explain.h"
 #include "utils/rel.h"
 
 #include <sqlite3.h>
@@ -963,8 +964,68 @@ sqliteExplainForeignScan(ForeignScanState *node,
 	 * If the ExplainForeignScan pointer is set to NULL, no additional
 	 * information is printed during EXPLAIN.
 	 */
+	sqlite3                  *db;
+	sqlite3_stmt             *result;
+	char                     *svr_database = NULL;
+	char                     *svr_table = NULL;
+	char                     *query;
+    size_t                   len;
+    int                      rc;
+    const char  *pzTail;
+	SQLiteFdwExecutionState *festate = (SQLiteFdwExecutionState *) node->fdw_state;
 
 	elog(DEBUG1,"entering function %s",__func__);
+
+	/* Show the query (only if VERBOSE) */
+	if (es->verbose)
+	{
+		/* show query */
+		ExplainPropertyText("sqlite query", festate->query, es);
+	}
+
+	/* Fetch options  */
+	sqliteGetOptions(RelationGetRelid(node->ss.ss_currentRelation), &svr_database, &svr_table);
+
+	/* Connect to the server */
+	if (sqlite3_open(svr_database, &db)) {
+		ereport(ERROR,
+			(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+			errmsg("Can't open sqlite database %s: %s", svr_database, sqlite3_errmsg(db))
+			));
+		sqlite3_close(db);
+	}
+
+	/* Build the query */
+    len = strlen(festate->query) + 20;
+    query = (char *)palloc(len);
+    snprintf(query, len, "EXPLAIN QUERY PLAN %s", festate->query);
+
+    /* Execute the query */
+	rc = sqlite3_prepare(db, query, -1, &result, &pzTail);
+	if (rc!=SQLITE_OK) {
+		ereport(ERROR,
+			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+			errmsg("SQL error during prepare: %s", sqlite3_errmsg(db))
+			));
+		sqlite3_close(db);
+	}
+
+	/* get the next record, if any, and fill in the slot */
+	while (sqlite3_step(result) == SQLITE_ROW)
+	{
+		/* I don't keep the three first columns;
+		   it could be a good idea to add that later */
+		//for (x = 0; x < sqlite3_column_count(festate->result); x++)
+		//{
+			ExplainPropertyText("sqlite plan", sqlite3_column_text(result, 3), es);
+		//}
+	}
+
+	// Free the query results
+	sqlite3_finalize(result);
+
+	// Close temporary connection
+	sqlite3_close(db);
 
 }
 
