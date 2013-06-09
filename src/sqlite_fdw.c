@@ -380,6 +380,14 @@ sqliteGetForeignRelSize(PlannerInfo *root,
 	 * possible. The function may also choose to update baserel->width if it
 	 * can compute a better estimate of the average result row width.
 	 */
+	sqlite3                  *db;
+	sqlite3_stmt             *result;
+	char                     *svr_database = NULL;
+	char                     *svr_table = NULL;
+	char                     *query;
+    size_t                   len;
+    int                      rc;
+    const char  *pzTail;
 
 	sqliteFdwPlanState *fdw_private;
 
@@ -391,6 +399,45 @@ sqliteGetForeignRelSize(PlannerInfo *root,
 	baserel->fdw_private = (void *) fdw_private;
 
 	/* initialize required state in fdw_private */
+
+	/* Fetch options  */
+	sqliteGetOptions(foreigntableid, &svr_database, &svr_table);
+
+	/* Connect to the server */
+	if (sqlite3_open(svr_database, &db)) {
+		ereport(ERROR,
+			(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+			errmsg("Can't open sqlite database %s: %s", svr_database, sqlite3_errmsg(db))
+			));
+		sqlite3_close(db);
+	}
+
+	/* Build the query */
+    len = strlen(svr_table) + 60;
+    query = (char *)palloc(len);
+    snprintf(query, len, "SELECT stat FROM sqlite_stat1 WHERE tbl='%s' AND idx IS NULL", svr_table);
+
+    /* Execute the query */
+	rc = sqlite3_prepare(db, query, -1, &result, &pzTail);
+	if (rc!=SQLITE_OK) {
+		ereport(ERROR,
+			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+			errmsg("SQL error during prepare: %s", sqlite3_errmsg(db))
+			));
+		sqlite3_close(db);
+	}
+
+	/* get the next record, if any, and fill in the slot */
+	if (sqlite3_step(result) == SQLITE_ROW)
+	{
+		baserel->rows = sqlite3_column_int(result, 0);
+	}
+
+	// Free the query results
+	sqlite3_finalize(result);
+
+	// Close temporary connection
+	sqlite3_close(db);
 
 }
 
