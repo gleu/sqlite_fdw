@@ -670,6 +670,20 @@ sqliteReScanForeignScan(ForeignScanState *node)
 	 * return exactly the same rows.
 	 */
 
+	elog(DEBUG1,"entering function %s",__func__);
+
+}
+
+
+static void
+sqliteEndForeignScan(ForeignScanState *node)
+{
+	/*
+	 * End the scan and release resources. It is normally not important to
+	 * release palloc'd memory, but for example open files and connections to
+	 * remote servers should be cleaned up.
+	 */
+
 	SQLiteFdwExecutionState *festate = (SQLiteFdwExecutionState *) node->fdw_state;
 
 	elog(DEBUG1,"entering function %s",__func__);
@@ -691,20 +705,6 @@ sqliteReScanForeignScan(ForeignScanState *node)
 		pfree(festate->query);
 		festate->query = 0;
 	}
-
-}
-
-
-static void
-sqliteEndForeignScan(ForeignScanState *node)
-{
-	/*
-	 * End the scan and release resources. It is normally not important to
-	 * release palloc'd memory, but for example open files and connections to
-	 * remote servers should be cleaned up.
-	 */
-
-	elog(DEBUG1,"entering function %s",__func__);
 
 }
 
@@ -774,6 +774,7 @@ sqlitePlanForeignModify(PlannerInfo *root,
 	 */
 
 	elog(DEBUG1,"entering function %s",__func__);
+
 
 	return NULL;
 }
