@@ -130,6 +130,7 @@ static bool sqliteAnalyzeForeignTable(Relation relation,
  */
 static bool sqliteIsValidOption(const char *option, Oid context);
 static void sqliteGetOptions(Oid foreigntableid, char **database, char **table);
+static int GetEstimatedRows(Oid foreigntableid);
 
 /* 
  * structures used by the FDW 
@@ -200,6 +201,8 @@ sqlite_fdw_handler(PG_FUNCTION_ARGS)
 	fdwroutine->GetForeignRelSize = sqliteGetForeignRelSize;
 	fdwroutine->GetForeignPaths = sqliteGetForeignPaths;
 	fdwroutine->GetForeignPlan = sqliteGetForeignPlan;
+#else
+	fdwroutine->PlanForeignScan = sqlitePlanForeignScan;
 #endif
 	fdwroutine->BeginForeignScan = sqliteBeginForeignScan;
 	fdwroutine->IterateForeignScan = sqliteIterateForeignScan;
@@ -381,15 +384,6 @@ sqliteGetForeignRelSize(PlannerInfo *root,
 	 * possible. The function may also choose to update baserel->width if it
 	 * can compute a better estimate of the average result row width.
 	 */
-	sqlite3                  *db;
-	sqlite3_stmt             *result;
-	char                     *svr_database = NULL;
-	char                     *svr_table = NULL;
-	char                     *query;
-    size_t                   len;
-    int                      rc;
-    const char  *pzTail;
-
 	sqliteFdwPlanState *fdw_private;
 
 	elog(DEBUG1,"entering function %s",__func__);
@@ -400,46 +394,7 @@ sqliteGetForeignRelSize(PlannerInfo *root,
 	baserel->fdw_private = (void *) fdw_private;
 
 	/* initialize required state in fdw_private */
-
-	/* Fetch options  */
-	sqliteGetOptions(foreigntableid, &svr_database, &svr_table);
-
-	/* Connect to the server */
-	if (sqlite3_open(svr_database, &db)) {
-		ereport(ERROR,
-			(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
-			errmsg("Can't open sqlite database %s: %s", svr_database, sqlite3_errmsg(db))
-			));
-		sqlite3_close(db);
-	}
-
-	/* Build the query */
-    len = strlen(svr_table) + 60;
-    query = (char *)palloc(len);
-    snprintf(query, len, "SELECT stat FROM sqlite_stat1 WHERE tbl='%s' AND idx IS NULL", svr_table);
-
-    /* Execute the query */
-	rc = sqlite3_prepare(db, query, -1, &result, &pzTail);
-	if (rc!=SQLITE_OK) {
-		ereport(ERROR,
-			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-			errmsg("SQL error during prepare: %s", sqlite3_errmsg(db))
-			));
-		sqlite3_close(db);
-	}
-
-	/* get the next record, if any, and fill in the slot */
-	if (sqlite3_step(result) == SQLITE_ROW)
-	{
-		baserel->rows = sqlite3_column_int(result, 0);
-	}
-
-	// Free the query results
-	sqlite3_finalize(result);
-
-	// Close temporary connection
-	sqlite3_close(db);
-
+	baserel->rows = GetEstimatedRows(foreigntableid);
 }
 
 static void
@@ -528,6 +483,27 @@ sqliteGetForeignPlan(PlannerInfo *root,
 							NIL,	/* no expressions to evaluate */
 							NIL);		/* no private state either */
 
+}
+#else
+static FdwPlan *
+sqlitePlanForeignScan(Oid foreigntableid, PlannerInfo *root, RelOptInfo *baserel)
+{
+	FdwPlan		*fdwplan;
+
+	/* Construct FdwPlan with cost estimates. */
+	fdwplan = makeNode(FdwPlan);
+
+
+	baserel->rows = GetEstimatedRows(foreigntableid);
+	// TODO: find a way to estimate the average row size
+	//baserel->width = ?;
+	baserel->tuples = baserel->rows;
+
+	fdwplan->startup_cost = 10;
+	fdwplan->total_cost = baserel->rows + fdwplan->startup_cost;
+	fdwplan->fdw_private = NIL;	/* not used */
+
+	return fdwplan;
 }
 #endif
 
@@ -1095,3 +1071,59 @@ sqliteAnalyzeForeignTable(Relation relation,
 	return false;
 }
 #endif
+
+static int
+GetEstimatedRows(Oid foreigntableid)
+{
+	sqlite3                  *db;
+	sqlite3_stmt             *result;
+	char                     *svr_database = NULL;
+	char                     *svr_table = NULL;
+	char                     *query;
+    size_t                   len;
+    int                      rc;
+    const char  *pzTail;
+
+	int rows = 0;
+
+	/* Fetch options  */
+	sqliteGetOptions(foreigntableid, &svr_database, &svr_table);
+
+	/* Connect to the server */
+	if (sqlite3_open(svr_database, &db)) {
+		ereport(ERROR,
+			(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+			errmsg("Can't open sqlite database %s: %s", svr_database, sqlite3_errmsg(db))
+			));
+		sqlite3_close(db);
+	}
+
+	/* Build the query */
+    len = strlen(svr_table) + 60;
+    query = (char *)palloc(len);
+    snprintf(query, len, "SELECT stat FROM sqlite_stat1 WHERE tbl='%s' AND idx IS NULL", svr_table);
+
+    /* Execute the query */
+	rc = sqlite3_prepare(db, query, -1, &result, &pzTail);
+	if (rc!=SQLITE_OK) {
+		ereport(ERROR,
+			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+			errmsg("SQL error during prepare: %s", sqlite3_errmsg(db))
+			));
+		sqlite3_close(db);
+	}
+
+	/* get the next record, if any, and fill in the slot */
+	if (sqlite3_step(result) == SQLITE_ROW)
+	{
+		rows = sqlite3_column_int(result, 0);
+	}
+
+	// Free the query results
+	sqlite3_finalize(result);
+
+	// Close temporary connection
+	sqlite3_close(db);
+
+	return rows;
+}
