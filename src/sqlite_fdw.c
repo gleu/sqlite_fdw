@@ -35,6 +35,13 @@
 PG_MODULE_MAGIC;
 
 /*
+ * Default values
+ */
+// This value is taken from sqlite
+// (without stats, sqlite defaults to 1 million tuples for a table)
+#define DEFAULT_ESTIMATED_LINES 1000000
+
+/*
  * SQL functions
  */
 extern Datum sqlite_fdw_handler(PG_FUNCTION_ARGS);
@@ -1098,13 +1105,8 @@ GetEstimatedRows(Oid foreigntableid)
 		sqlite3_close(db);
 	}
 
-	/* Build the query */
-    len = strlen(svr_table) + 60;
-    query = (char *)palloc(len);
-    snprintf(query, len, "SELECT stat FROM sqlite_stat1 WHERE tbl='%s' AND idx IS NULL", svr_table);
-
-    /* Execute the query */
-	rc = sqlite3_prepare(db, query, -1, &result, &pzTail);
+	/* Check that the sqlite_stat1 table exists */
+	rc = sqlite3_prepare(db, "SELECT 1 FROM sqlite_master WHERE name='sqlite_stat1'", -1, &result, &pzTail);
 	if (rc!=SQLITE_OK) {
 		ereport(ERROR,
 			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
@@ -1112,15 +1114,55 @@ GetEstimatedRows(Oid foreigntableid)
 			));
 		sqlite3_close(db);
 	}
-
-	/* get the next record, if any, and fill in the slot */
-	if (sqlite3_step(result) == SQLITE_ROW)
+	if (sqlite3_step(result) != SQLITE_ROW)
 	{
-		rows = sqlite3_column_int(result, 0);
+		ereport(WARNING,
+			(errcode(ERRCODE_FDW_TABLE_NOT_FOUND),
+			errmsg("The sqlite3 database has not been analyzed."),
+			errhint("Run ANALYZE on table \"%s\", database \"%s\".", svr_table, svr_database)
+			));
+		rows = 10;
 	}
 
 	// Free the query results
 	sqlite3_finalize(result);
+
+	if (rows == 0)
+	{
+		/* Build the query */
+	    len = strlen(svr_table) + 60;
+	    query = (char *)palloc(len);
+	    snprintf(query, len, "SELECT stat FROM sqlite_stat1 WHERE tbl='%s' AND idx IS NULL", svr_table);
+	    elog(LOG, "query:%s", query);
+
+	    /* Execute the query */
+		rc = sqlite3_prepare(db, query, -1, &result, &pzTail);
+		if (rc!=SQLITE_OK) {
+			ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				errmsg("SQL error during prepare: %s", sqlite3_errmsg(db))
+				));
+			sqlite3_close(db);
+		}
+
+		/* get the next record, if any, and fill in the slot */
+		if (sqlite3_step(result) == SQLITE_ROW)
+		{
+			rows = sqlite3_column_int(result, 0);
+		}
+
+		// Free the query results
+		sqlite3_finalize(result);
+	}
+	else
+	{
+		/*
+		 * The sqlite database doesn't have any statistics.
+		 * There's not much we can do, except using a hardcoded one.
+		 * Using a foreign table option might be a better solution.
+		 */
+		rows = DEFAULT_ESTIMATED_LINES;
+	}
 
 	// Close temporary connection
 	sqlite3_close(db);
