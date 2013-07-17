@@ -31,6 +31,7 @@
 #include "utils/rel.h"
 
 #include <sqlite3.h>
+#include <sys/stat.h>
 
 PG_MODULE_MAGIC;
 
@@ -138,6 +139,8 @@ static bool sqliteAnalyzeForeignTable(Relation relation,
 static bool sqliteIsValidOption(const char *option, Oid context);
 static void sqliteGetOptions(Oid foreigntableid, char **database, char **table);
 static int GetEstimatedRows(Oid foreigntableid);
+static bool file_exists(const char *name);
+
 
 /* 
  * structures used by the FDW 
@@ -291,6 +294,11 @@ sqlite_fdw_validator(PG_FUNCTION_ARGS)
 				ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
 					errmsg("redundant options: database (%s)", defGetString(def))
+					));
+			if (!file_exists(defGetString(def)))
+				ereport(ERROR,
+					(errcode_for_file_access(),
+					errmsg("could not access file \"%s\"", defGetString(def))
 					));
 
 			svr_database = defGetString(def);
@@ -1168,4 +1176,21 @@ GetEstimatedRows(Oid foreigntableid)
 	sqlite3_close(db);
 
 	return rows;
+}
+
+static bool
+file_exists(const char *name)
+{
+    struct stat st;
+
+    AssertArg(name != NULL);
+
+    if (stat(name, &st) == 0)
+        return S_ISDIR(st.st_mode) ? false : true;
+    else if (!(errno == ENOENT || errno == ENOTDIR || errno == EACCES))
+        ereport(ERROR,
+                (errcode_for_file_access(),
+                 errmsg("could not access file \"%s\": %m", name)));
+
+    return false;
 }
