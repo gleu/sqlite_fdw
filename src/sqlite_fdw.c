@@ -315,6 +315,13 @@ sqlite_fdw_validator(PG_FUNCTION_ARGS)
 		}
 	}
 
+	/* Check we have the options we need to proceed */
+	if (catalog == ForeignServerRelationId && !svr_database)
+		ereport(ERROR,
+			(errcode(ERRCODE_SYNTAX_ERROR),
+			errmsg("The database name must be specified")
+			));
+
 	PG_RETURN_VOID();
 }
 
