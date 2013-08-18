@@ -654,7 +654,9 @@ sqliteIterateForeignScan(ForeignScanState *node)
 		values = (char **) palloc(sizeof(char *) * sqlite3_column_count(festate->result));
 
 		for (x = 0; x < sqlite3_column_count(festate->result); x++)
-			values[x] = sqlite3_column_text(festate->result, x);
+		{
+			values[x] = (char *) sqlite3_column_text(festate->result, x);
+		}
 
 		tuple = BuildTupleFromCStrings(TupleDescGetAttInMetadata(node->ss.ss_currentRelation->rd_att), values);
 		ExecStoreTuple(tuple, slot, InvalidBuffer, false);
@@ -1022,7 +1024,7 @@ sqliteExplainForeignScan(ForeignScanState *node,
 		   it could be a good idea to add that later */
 		//for (x = 0; x < sqlite3_column_count(festate->result); x++)
 		//{
-			ExplainPropertyText("sqlite plan", sqlite3_column_text(result, 3), es);
+			ExplainPropertyText("sqlite plan", (char*)sqlite3_column_text(result, 3), es);
 		//}
 	}
 
