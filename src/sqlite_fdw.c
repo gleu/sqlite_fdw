@@ -583,12 +583,6 @@ sqliteBeginForeignScan(ForeignScanState *node,
 		sqlite3_close(db);
 	}
 
-	/* If the table option is empty, take the local object name as the remote one */
-	if (!svr_table)
-	{
-		svr_table = pstrdup(RelationGetRelationName(node->ss.ss_currentRelation));
-	}
-
 	/* Build the query */
     len = strlen(svr_table) + 15;
     query = (char *)palloc(len);
