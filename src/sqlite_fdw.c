@@ -29,6 +29,7 @@
 #include "commands/defrem.h"
 #include "commands/explain.h"
 #include "utils/rel.h"
+#include "utils/lsyscache.h"
 
 #include <sqlite3.h>
 #include <sys/stat.h>
@@ -369,14 +370,23 @@ sqliteGetOptions(Oid foreigntableid, char **database, char **table)
 		DefElem *def = (DefElem *) lfirst(lc);
 
 		if (strcmp(def->defname, "database") == 0)
+		{
 			*database = defGetString(def);
+		}
 
 		if (strcmp(def->defname, "table") == 0)
+		{
 			*table = defGetString(def);
+		}
+	}
+
+	if (!*table)
+	{
+		*table = get_rel_name(foreigntableid);
 	}
 
 	/* Check we have the options we need to proceed */
-	if (!*database && !*table)
+	if (!*database || !*table)
 		ereport(ERROR,
 			(errcode(ERRCODE_SYNTAX_ERROR),
 			errmsg("a database and a table must be specified")
