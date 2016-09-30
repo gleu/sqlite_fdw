@@ -39,8 +39,10 @@ PG_MODULE_MAGIC;
 /*
  * Default values
  */
-// This value is taken from sqlite
-// (without stats, sqlite defaults to 1 million tuples for a table)
+/* ----
+ * This value is taken from sqlite
+   (without stats, sqlite defaults to 1 million tuples for a table)
+ */
 #define DEFAULT_ESTIMATED_LINES 1000000
 
 /*
@@ -137,14 +139,16 @@ static bool sqliteAnalyzeForeignTable(Relation relation,
 /*
  * Helper functions
  */
+static void sqliteOpen(char *filename, sqlite3 **db);
+static void sqlitePrepare(sqlite3 *db, char *query, sqlite3_stmt **result, const char **pzTail);
 static bool sqliteIsValidOption(const char *option, Oid context);
 static void sqliteGetOptions(Oid foreigntableid, char **database, char **table);
 static int GetEstimatedRows(Oid foreigntableid);
 static bool file_exists(const char *name);
 
 
-/* 
- * structures used by the FDW 
+/*
+ * structures used by the FDW
  *
  * These next two are not actually used by sqlite, but something like this
  * will be needed by anything more complicated that does actual work.
@@ -177,7 +181,7 @@ static struct SQLiteFdwOption valid_options[] =
 };
 
 /*
- * This is what will be set and stashed away in fdw_private and fetched 
+ * This is what will be set and stashed away in fdw_private and fetched
  * for subsequent routines.
  */
 typedef struct
@@ -282,9 +286,9 @@ sqlite_fdw_validator(PG_FUNCTION_ARGS)
 							 opt->optname);
 			}
 
-			ereport(ERROR, 
-				(errcode(ERRCODE_FDW_INVALID_OPTION_NAME), 
-				errmsg("invalid option \"%s\"", def->defname), 
+			ereport(ERROR,
+				(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+				errmsg("invalid option \"%s\"", def->defname),
 				errhint("Valid options in this context are: %s", buf.len ? buf.data : "<none>")
 				));
 		}
@@ -327,6 +331,43 @@ sqlite_fdw_validator(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Open the given sqlite3 file, and throw an error if the file couldn't be
+ * opened
+ */
+static void
+sqliteOpen(char *filename, sqlite3 **db)
+{
+	if (sqlite3_open(filename, db) != SQLITE_OK) {
+		ereport(ERROR,
+			(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+			errmsg("Can't open sqlite database %s: %s", filename, sqlite3_errmsg(*db))
+			));
+		sqlite3_close(*db);
+	}
+}
+/*
+ * Prepare the given query. If case of error, close the db and throw an error
+ */
+static void
+sqlitePrepare(sqlite3 *db, char *query, sqlite3_stmt **result,
+		const char **pzTail)
+{
+	int rc;
+
+	/* Execute the query */
+	rc = sqlite3_prepare(db, query, -1, result, pzTail);
+	if (rc != SQLITE_OK)
+	{
+		ereport(ERROR,
+			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+			errmsg("SQL error during prepare: %s", sqlite3_errmsg(db))
+			));
+
+		sqlite3_close(db);
+	}
+}
+
+/*
  * Check if the provided option is one of the valid options.
  * context is the Oid of the catalog holding the object the option is for.
  */
@@ -340,6 +381,7 @@ sqliteIsValidOption(const char *option, Oid context)
 		if (context == opt->optcontext && strcmp(opt->optname, option) == 0)
 			return true;
 	}
+
 	return false;
 }
 
@@ -527,8 +569,8 @@ sqlitePlanForeignScan(Oid foreigntableid, PlannerInfo *root, RelOptInfo *baserel
 
 
 	baserel->rows = GetEstimatedRows(foreigntableid);
-	// TODO: find a way to estimate the average row size
-	//baserel->width = ?;
+	/* TODO: find a way to estimate the average row size */
+	/*baserel->width = ?; */
 	baserel->tuples = baserel->rows;
 
 	fdwplan->startup_cost = 10;
@@ -567,7 +609,7 @@ sqliteBeginForeignScan(ForeignScanState *node,
 	char                     *svr_database = NULL;
 	char                     *svr_table = NULL;
 	char                     *query;
-    size_t                   len;
+	size_t                   len;
 
 	elog(DEBUG1,"entering function %s",__func__);
 
@@ -575,18 +617,12 @@ sqliteBeginForeignScan(ForeignScanState *node,
 	sqliteGetOptions(RelationGetRelid(node->ss.ss_currentRelation), &svr_database, &svr_table);
 
 	/* Connect to the server */
-	if (sqlite3_open(svr_database, &db)) {
-		ereport(ERROR,
-			(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
-			errmsg("Can't open sqlite database %s: %s", svr_database, sqlite3_errmsg(db))
-			));
-		sqlite3_close(db);
-	}
+	sqliteOpen(svr_database, &db);
 
 	/* Build the query */
-    len = strlen(svr_table) + 15;
-    query = (char *)palloc(len);
-    snprintf(query, len, "SELECT * FROM %s", svr_table);
+	len = strlen(svr_table) + 15;
+	query = (char *)palloc(len);
+	snprintf(query, len, "SELECT * FROM %s", svr_table);
 
 	/* Stash away the state info we have already */
 	festate = (SQLiteFdwExecutionState *) palloc(sizeof(SQLiteFdwExecutionState));
@@ -594,7 +630,6 @@ sqliteBeginForeignScan(ForeignScanState *node,
 	festate->conn = db;
 	festate->result = NULL;
 	festate->query = query;
-
 }
 
 
@@ -628,26 +663,18 @@ sqliteIterateForeignScan(ForeignScanState *node)
 	char        **values;
 	HeapTuple   tuple;
 	int         x;
-    const char  *pzTail;
-    int         rc;
+	const char  *pzTail;
 
 	SQLiteFdwExecutionState *festate = (SQLiteFdwExecutionState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 
+	elog(DEBUG1,"entering function %s",__func__);
+
 	/* Execute the query, if required */
 	if (!festate->result)
 	{
-		rc = sqlite3_prepare(festate->conn, festate->query, -1, &festate->result, &pzTail);
-		if (rc!=SQLITE_OK) {
-			ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				errmsg("SQL error during prepare: %s", sqlite3_errmsg(festate->conn))
-				));
-			sqlite3_close(festate->conn);
-		}
+		sqlitePrepare(festate->conn, festate->query, &festate->result, &pzTail);
 	}
-
-	elog(DEBUG1,"entering function %s",__func__);
 
 	ExecClearTuple(slot);
 
@@ -975,15 +1002,14 @@ sqliteExplainForeignScan(ForeignScanState *node,
 	 * If the ExplainForeignScan pointer is set to NULL, no additional
 	 * information is printed during EXPLAIN.
 	 */
-	sqlite3                  *db;
-	sqlite3_stmt             *result;
-	char                     *svr_database = NULL;
-	char                     *svr_table = NULL;
-	char                     *query;
-    size_t                   len;
-    int                      rc;
-    const char  *pzTail;
-	SQLiteFdwExecutionState *festate = (SQLiteFdwExecutionState *) node->fdw_state;
+	sqlite3					   *db;
+	sqlite3_stmt			   *result;
+	char					   *svr_database = NULL;
+	char					   *svr_table = NULL;
+	char					   *query;
+	size_t						len;
+	const char				   *pzTail;
+	SQLiteFdwExecutionState	   *festate = (SQLiteFdwExecutionState *) node->fdw_state;
 
 	elog(DEBUG1,"entering function %s",__func__);
 
@@ -998,44 +1024,35 @@ sqliteExplainForeignScan(ForeignScanState *node,
 	sqliteGetOptions(RelationGetRelid(node->ss.ss_currentRelation), &svr_database, &svr_table);
 
 	/* Connect to the server */
-	if (sqlite3_open(svr_database, &db)) {
-		ereport(ERROR,
-			(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
-			errmsg("Can't open sqlite database %s: %s", svr_database, sqlite3_errmsg(db))
-			));
-		sqlite3_close(db);
-	}
+	sqliteOpen(svr_database, &db);
 
 	/* Build the query */
-    len = strlen(festate->query) + 20;
-    query = (char *)palloc(len);
-    snprintf(query, len, "EXPLAIN QUERY PLAN %s", festate->query);
+	len = strlen(festate->query) + 20;
+	query = (char *)palloc(len);
+	snprintf(query, len, "EXPLAIN QUERY PLAN %s", festate->query);
 
     /* Execute the query */
-	rc = sqlite3_prepare(db, query, -1, &result, &pzTail);
-	if (rc!=SQLITE_OK) {
-		ereport(ERROR,
-			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-			errmsg("SQL error during prepare: %s", sqlite3_errmsg(db))
-			));
-		sqlite3_close(db);
-	}
+	sqlitePrepare(db, query, &result, &pzTail);
 
 	/* get the next record, if any, and fill in the slot */
 	while (sqlite3_step(result) == SQLITE_ROW)
 	{
-		/* I don't keep the three first columns;
-		   it could be a good idea to add that later */
-		//for (x = 0; x < sqlite3_column_count(festate->result); x++)
-		//{
+		/*
+		 * I don't keep the three first columns;
+		   it could be a good idea to add that later
+		 */
+		/*
+		 * for (x = 0; x < sqlite3_column_count(festate->result); x++)
+		 * {
+		 */
 			ExplainPropertyText("sqlite plan", (char*)sqlite3_column_text(result, 3), es);
-		//}
+		/* } */
 	}
 
-	// Free the query results
+	/* Free the query results */
 	sqlite3_finalize(result);
 
-	// Close temporary connection
+	/* Close temporary connection */
 	sqlite3_close(db);
 
 }
@@ -1109,14 +1126,13 @@ sqliteAnalyzeForeignTable(Relation relation,
 static int
 GetEstimatedRows(Oid foreigntableid)
 {
-	sqlite3                  *db;
-	sqlite3_stmt             *result;
-	char                     *svr_database = NULL;
-	char                     *svr_table = NULL;
-	char                     *query;
-    size_t                   len;
-    int                      rc;
-    const char  *pzTail;
+	sqlite3		   *db;
+	sqlite3_stmt   *result;
+	char		   *svr_database = NULL;
+	char		   *svr_table = NULL;
+	char		   *query;
+	size_t			len;
+	const char	   *pzTail;
 
 	int rows = 0;
 
@@ -1124,23 +1140,11 @@ GetEstimatedRows(Oid foreigntableid)
 	sqliteGetOptions(foreigntableid, &svr_database, &svr_table);
 
 	/* Connect to the server */
-	if (sqlite3_open(svr_database, &db)) {
-		ereport(ERROR,
-			(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
-			errmsg("Can't open sqlite database %s: %s", svr_database, sqlite3_errmsg(db))
-			));
-		sqlite3_close(db);
-	}
+	sqliteOpen(svr_database, &db);
 
 	/* Check that the sqlite_stat1 table exists */
-	rc = sqlite3_prepare(db, "SELECT 1 FROM sqlite_master WHERE name='sqlite_stat1'", -1, &result, &pzTail);
-	if (rc!=SQLITE_OK) {
-		ereport(ERROR,
-			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-			errmsg("SQL error during prepare: %s", sqlite3_errmsg(db))
-			));
-		sqlite3_close(db);
-	}
+	sqlitePrepare(db, "SELECT 1 FROM sqlite_master WHERE name='sqlite_stat1'", &result, &pzTail);
+
 	if (sqlite3_step(result) != SQLITE_ROW)
 	{
 		ereport(WARNING,
@@ -1151,7 +1155,7 @@ GetEstimatedRows(Oid foreigntableid)
 		rows = 10;
 	}
 
-	// Free the query results
+	/* Free the query results */
 	sqlite3_finalize(result);
 
 	if (rows == 0)
@@ -1163,14 +1167,7 @@ GetEstimatedRows(Oid foreigntableid)
 	    elog(LOG, "query:%s", query);
 
 	    /* Execute the query */
-		rc = sqlite3_prepare(db, query, -1, &result, &pzTail);
-		if (rc!=SQLITE_OK) {
-			ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				errmsg("SQL error during prepare: %s", sqlite3_errmsg(db))
-				));
-			sqlite3_close(db);
-		}
+		sqlitePrepare(db, query, &result, &pzTail);
 
 		/* get the next record, if any, and fill in the slot */
 		if (sqlite3_step(result) == SQLITE_ROW)
@@ -1178,7 +1175,7 @@ GetEstimatedRows(Oid foreigntableid)
 			rows = sqlite3_column_int(result, 0);
 		}
 
-		// Free the query results
+		/* Free the query results */
 		sqlite3_finalize(result);
 	}
 	else
@@ -1191,7 +1188,7 @@ GetEstimatedRows(Oid foreigntableid)
 		rows = DEFAULT_ESTIMATED_LINES;
 	}
 
-	// Close temporary connection
+	/* Close temporary connection */
 	sqlite3_close(db);
 
 	return rows;
@@ -1200,16 +1197,16 @@ GetEstimatedRows(Oid foreigntableid)
 static bool
 file_exists(const char *name)
 {
-    struct stat st;
+	struct stat st;
 
-    AssertArg(name != NULL);
+	AssertArg(name != NULL);
 
-    if (stat(name, &st) == 0)
-        return S_ISDIR(st.st_mode) ? false : true;
-    else if (!(errno == ENOENT || errno == ENOTDIR || errno == EACCES))
-        ereport(ERROR,
+	if (stat(name, &st) == 0)
+		return S_ISDIR(st.st_mode) ? false : true;
+	else if (!(errno == ENOENT || errno == ENOTDIR || errno == EACCES))
+		ereport(ERROR,
                 (errcode_for_file_access(),
-                 errmsg("could not access file \"%s\": %m", name)));
+				 errmsg("could not access file \"%s\": %m", name)));
 
-    return false;
+	return false;
 }
