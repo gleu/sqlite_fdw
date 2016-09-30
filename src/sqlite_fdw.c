@@ -70,7 +70,12 @@ static ForeignScan *sqliteGetForeignPlan(PlannerInfo *root,
 						Oid foreigntableid,
 						ForeignPath *best_path,
 						List *tlist,
+#if (PG_VERSION_NUM >= 90500)
+						List *scan_clauses,
+						Plan *outer_plan);
+#else
 						List *scan_clauses);
+#endif
 #else
 static FdwPlan *sqlitePlanForeignScan(Oid foreigntableid, PlannerInfo *root, RelOptInfo *baserel);
 #endif
@@ -511,6 +516,9 @@ sqliteGetForeignPaths(PlannerInfo *root,
 									 total_cost,
 									 NIL,		/* no pathkeys */
 									 NULL,		/* no outer rel either */
+#if (PG_VERSION_NUM >= 90500)
+									 NULL,		/* no extra plan */
+#endif
 									 NIL));		/* no fdw_private data */
 }
 
@@ -522,7 +530,12 @@ sqliteGetForeignPlan(PlannerInfo *root,
 						Oid foreigntableid,
 						ForeignPath *best_path,
 						List *tlist,
+#if (PG_VERSION_NUM >= 90500)
+						List *scan_clauses,
+						Plan *outer_plan)
+#else
 						List *scan_clauses)
+#endif
 {
 	/*
 	 * Create a ForeignScan plan node from the selected foreign access path.
@@ -555,7 +568,14 @@ sqliteGetForeignPlan(PlannerInfo *root,
 							scan_clauses,
 							scan_relid,
 							NIL,	/* no expressions to evaluate */
-							NIL);		/* no private state either */
+#if (PG_VERSION_NUM >= 90500)
+							NIL,	/* no private state */
+							NIL,	/* no custom tlist */
+							NIL,	/* no recheck quals */
+							NULL);	/* no extra plan */
+#else
+							NIL);	/* no private state */
+#endif
 
 }
 #else
