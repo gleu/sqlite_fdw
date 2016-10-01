@@ -24,10 +24,13 @@
 #include "optimizer/restrictinfo.h"
 
 #include "funcapi.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
+#include "utils/builtins.h"
+#include "utils/formatting.h"
 #include "utils/rel.h"
 #include "utils/lsyscache.h"
 
@@ -141,6 +144,11 @@ static bool sqliteAnalyzeForeignTable(Relation relation,
 							 BlockNumber *totalpages);
 #endif
 
+#if (PG_VERSION_NUM >= 90500)
+static List *sqliteImportForeignSchema(ImportForeignSchemaStmt *stmt,
+							 Oid serverOid);
+#endif
+
 /*
  * Helper functions
  */
@@ -150,6 +158,10 @@ static bool sqliteIsValidOption(const char *option, Oid context);
 static void sqliteGetOptions(Oid foreigntableid, char **database, char **table);
 static int GetEstimatedRows(Oid foreigntableid);
 static bool file_exists(const char *name);
+#if (PG_VERSION_NUM >= 90500)
+/* only used for IMPORT FOREIGN SCHEMA */
+static void sqliteTranslateType(StringInfo str, char *typname);
+#endif
 
 
 /*
@@ -250,6 +262,11 @@ sqlite_fdw_handler(PG_FUNCTION_ARGS)
 #if (PG_VERSION_NUM >= 90200)
 	/* support for ANALYSE */
 	fdwroutine->AnalyzeForeignTable = sqliteAnalyzeForeignTable;
+#endif
+
+#if (PG_VERSION_NUM >= 90500)
+	/* support for IMPORT FOREIGN SCHEMA */
+	fdwroutine->ImportForeignSchema = sqliteImportForeignSchema;
 #endif
 
 	PG_RETURN_POINTER(fdwroutine);
@@ -1146,6 +1163,192 @@ sqliteAnalyzeForeignTable(Relation relation,
 }
 #endif
 
+#if (PG_VERSION_NUM >= 90500)
+static List *
+sqliteImportForeignSchema(ImportForeignSchemaStmt *stmt,
+							 Oid serverOid)
+{
+	sqlite3		   *volatile db = NULL;
+	sqlite3_stmt   *volatile tbls = NULL;
+	ForeignServer  *f_server;
+	ListCell	   *lc;
+	char		   *svr_database = NULL;
+	StringInfoData	query_tbl;
+	const char	   *pzTail;
+	List		   *commands = NIL;
+	bool			import_default = false;
+	bool			import_not_null = true;
+
+	elog(DEBUG1,"entering function %s",__func__);
+
+	/*
+	 * The only legit sqlite schema are temp and main (or name of an attached
+	 * database, which can't happen here).  Authorize only legit "main" schema,
+	 * and "public" just in case.
+	 */
+	if (strcmp(stmt->remote_schema, "public") != 0 &&
+		strcmp(stmt->remote_schema, "main") != 0)
+	{
+		ereport(ERROR,
+			(errcode(ERRCODE_FDW_SCHEMA_NOT_FOUND),
+			errmsg("Foreign schema \"%s\" is invalid", stmt->remote_schema)
+			));
+	}
+
+	/* Parse statement options */
+	foreach(lc, stmt->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "import_default") == 0)
+			import_default = defGetBoolean(def);
+		else if (strcmp(def->defname, "import_not_null") == 0)
+			import_not_null = defGetBoolean(def);
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+					  errmsg("invalid option \"%s\"", def->defname)));
+	}
+
+	/* get the db filename */
+	f_server = GetForeignServerByName(stmt->server_name, false);
+	foreach(lc, f_server->options)
+	{
+		DefElem *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "database") == 0)
+		{
+			svr_database = defGetString(def);
+			break;
+		}
+	}
+
+	Assert(svr_database);
+
+	/* Connect to the server */
+	sqliteOpen(svr_database, (sqlite3 **) &db);
+
+	PG_TRY();
+	{
+
+		initStringInfo(&query_tbl);
+		appendStringInfo(&query_tbl, "SELECT name FROM sqlite_master WHERE type = 'table'");
+
+		/* Handle LIMIT TO / EXCEPT clauses in IMPORT FOREIGN SCHEMA statement */
+		if (stmt->list_type == FDW_IMPORT_SCHEMA_LIMIT_TO ||
+			stmt->list_type == FDW_IMPORT_SCHEMA_EXCEPT)
+		{
+			bool		first_item = true;
+
+			appendStringInfoString(&query_tbl, " AND name ");
+			if (stmt->list_type == FDW_IMPORT_SCHEMA_EXCEPT)
+				appendStringInfoString(&query_tbl, "NOT ");
+			appendStringInfoString(&query_tbl, "IN (");
+
+			foreach(lc, stmt->table_list)
+			{
+				RangeVar *rv = (RangeVar *) lfirst(lc);
+
+				if (first_item)
+					first_item = false;
+				else
+					appendStringInfoString(&query_tbl, ", ");
+
+				appendStringInfoString(&query_tbl, quote_literal_cstr(rv->relname));
+			}
+			appendStringInfoChar(&query_tbl, ')');
+		}
+
+		/* Iterate to all matching tables, and get their definition */
+		sqlitePrepare(db, query_tbl.data, (sqlite3_stmt **) &tbls, &pzTail);
+		while (sqlite3_step(tbls) == SQLITE_ROW)
+		{
+			sqlite3_stmt   *cols;
+			char		   *tbl_name;
+			char		   *query_cols;
+			StringInfoData	cft_stmt;
+			int				i = 0;
+
+			tbl_name = (char *) sqlite3_column_text(tbls, 0);
+
+			/*
+			 * user-defined list of tables has been handled in main query, don't
+			 * try to do the job here again
+			 */
+
+			/* start building the CFT stmt */
+			initStringInfo(&cft_stmt);
+			appendStringInfo(&cft_stmt, "CREATE FOREIGN TABLE %s.%s (\n",
+					stmt->local_schema, quote_identifier(tbl_name));
+
+			query_cols = palloc0(strlen(tbl_name) + 19 + 1);
+			sprintf(query_cols, "PRAGMA table_info(%s)", tbl_name);
+
+			sqlitePrepare(db, query_cols, &cols, &pzTail);
+			while (sqlite3_step(cols) == SQLITE_ROW)
+			{
+				char   *col_name;
+				char   *typ_name;
+				bool	not_null;
+				char   *default_val;
+
+				col_name = (char *) sqlite3_column_text(cols, 1);
+				typ_name = (char *) sqlite3_column_text(cols, 2);
+				not_null = (sqlite3_column_int(cols, 3) == 1);
+				default_val = (char *) sqlite3_column_text(cols, 4);
+
+				if (i != 0)
+					appendStringInfo(&cft_stmt, ",\n");
+
+				/* table name */
+				appendStringInfo(&cft_stmt, "%s ",
+						quote_identifier(col_name));
+
+				/* translated datatype */
+				sqliteTranslateType(&cft_stmt, typ_name);
+
+				if (not_null && import_not_null)
+					appendStringInfo(&cft_stmt, " NOT NULL");
+
+				if (default_val && import_default)
+					appendStringInfo(&cft_stmt, " DEFAULT %s", default_val);
+
+				i++;
+			}
+			appendStringInfo(&cft_stmt, "\n) SERVER %s\n"
+					"OPTIONS (table '%s')",
+					quote_identifier(stmt->server_name),
+					quote_identifier(tbl_name));
+
+			commands = lappend(commands,
+					pstrdup(cft_stmt.data));
+
+			/* free per-table allocated data */
+			pfree(query_cols);
+			pfree(cft_stmt.data);
+		}
+
+		/* Free all needed data and close connection*/
+		pfree(query_tbl.data);
+	}
+	PG_CATCH();
+	{
+		if (tbls)
+			sqlite3_finalize(tbls);
+		if (db)
+			sqlite3_close(db);
+
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	sqlite3_finalize(tbls);
+	sqlite3_close(db);
+
+	return commands;
+}
+#endif
+
 static int
 GetEstimatedRows(Oid foreigntableid)
 {
@@ -1233,3 +1436,45 @@ file_exists(const char *name)
 
 	return false;
 }
+
+#if (PG_VERSION_NUM >= 90500)
+/*
+ * Translate sqlite type name to postgres compatible one and append it to
+ * given StringInfo
+ */
+static void
+sqliteTranslateType(StringInfo str, char *typname)
+{
+	char *type;
+
+	/*
+	 * get lowercase typname. We use C collation since the original type name
+	 * should not contain exotic character.
+	 */
+	type = str_tolower(typname, strlen(typname), C_COLLATION_OID);
+
+	/* try some easy conversion, from https://www.sqlite.org/datatype3.html */
+	if (strcmp(type, "tinyint") == 0)
+		appendStringInfoString(str, "smallint");
+
+	else if (strcmp(type, "mediumint") == 0)
+		appendStringInfoString(str, "integer");
+
+	else if (strcmp(type, "unsigned big int") == 0)
+		appendStringInfoString(str, "bigint");
+
+	else if (strcmp(type, "double") == 0)
+		appendStringInfoString(str, "double precision");
+
+	else if (strcmp(type, "datetime") == 0)
+		appendStringInfoString(str, "timestamp");
+
+	/* XXX try harder handling sqlite datatype */
+
+	/* if original type is compatible, return lowercase value */
+	else
+		appendStringInfoString(str, type);
+
+	pfree(type);
+}
+#endif
