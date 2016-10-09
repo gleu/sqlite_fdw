@@ -2,7 +2,7 @@
  *
  * sqlite Foreign Data Wrapper for PostgreSQL
  *
- * Copyright (c) 2013 Guillaume Lelarge
+ * Copyright (c) 2013-2016 Guillaume Lelarge
  *
  * This software is released under the PostgreSQL Licence
  *
