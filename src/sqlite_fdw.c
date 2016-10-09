@@ -1230,9 +1230,10 @@ sqliteImportForeignSchema(ImportForeignSchemaStmt *stmt,
 
 	PG_TRY();
 	{
-
+		/* You want all tables, except system tables */
 		initStringInfo(&query_tbl);
 		appendStringInfo(&query_tbl, "SELECT name FROM sqlite_master WHERE type = 'table'");
+		appendStringInfo(&query_tbl, " AND name NOT LIKE 'sqlite_%%'");
 
 		/* Handle LIMIT TO / EXCEPT clauses in IMPORT FOREIGN SCHEMA statement */
 		if (stmt->list_type == FDW_IMPORT_SCHEMA_LIMIT_TO ||
