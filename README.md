@@ -43,6 +43,13 @@ CREATE FOREIGN TABLE local_t1(... columns ...)
   OPTIONS (table 'remote_table');
 </pre>
 
+Since 9.5, you can also import the tables of a specific schema in your sqlite
+database, just like this :
+
+<pre>
+IMPORT FOREIGN SCHEMA public FROM SERVER slserver INTO public;
+</pre>
+
 Now, to get the contents of the remote table, you just need to execute a SELECT query on it:
 
 <pre>
