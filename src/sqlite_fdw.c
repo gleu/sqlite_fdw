@@ -1470,6 +1470,9 @@ sqliteTranslateType(StringInfo str, char *typname)
 	else if (strcmp(type, "datetime") == 0)
 		appendStringInfoString(str, "timestamp");
 
+	else if (strcmp(type, "nvarchar text") == 0)
+		appendStringInfoString(str, "text");
+
 	/* XXX try harder handling sqlite datatype */
 
 	/* if original type is compatible, return lowercase value */
