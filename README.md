@@ -47,7 +47,7 @@ Since 9.5, you can also import the tables of a specific schema in your sqlite
 database, just like this :
 
 <pre>
-IMPORT FOREIGN SCHEMA public FROM SERVER slserver INTO public;
+IMPORT FOREIGN SCHEMA public FROM SERVER sqlite_server INTO public;
 </pre>
 
 Now, to get the contents of the remote table, you just need to execute a SELECT query on it:
