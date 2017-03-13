@@ -1476,6 +1476,9 @@ sqliteTranslateType(StringInfo str, char *typname)
 	else if (strcmp(type, "longvarchar") == 0)
 	     appendStringInfoString(str, "text");
 
+	else if (strncmp(type, "text", 4) == 0)
+	     appendStringInfoString(str, "text");
+
 	else if (strcmp(type, "blob") == 0)
 	     appendStringInfoString(str, "bytea");
 
