@@ -1487,6 +1487,11 @@ sqliteTranslateType(StringInfo str, char *typname)
 	      * bytes.  Need to assume worst case. */
 	     appendStringInfoString(str, "bigint");
 
+	else if (strcmp(type, "") == 0)
+	     /* Type "integer" appears dynamically sized between 1 and 8
+	      * bytes.  Need to assume worst case. */
+	     appendStringInfoString(str, "text");
+
 	/* XXX try harder handling sqlite datatype */
 
 	/* if original type is compatible, return lowercase value */
