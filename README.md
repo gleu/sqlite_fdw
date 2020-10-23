@@ -3,6 +3,10 @@ sqlite_fdw
 
 Foreign Data Wrapper for sqlite
 
+This was my attempt to write a Foreign Data Wrapper. Unfortunately, it didn't go long. I may work on it again in the future, just to understand how to write a Foreign Data Wrapper.
+
+If you're looking for a sqlite Foreign Data Wrapper, you shouldn't use this one as it lacks important features. Instead, have a look at https://github.com/pgspider/sqlite_fdw.git.
+
 Compilation
 -----------
 
